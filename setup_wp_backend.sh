@@ -60,8 +60,8 @@ if (isset($_SERVER['HTTP_X_FORWARDED_HOST']) && !empty($_SERVER['HTTP_X_FORWARDE
 }
 
 // Define WordPress URLs
-define('WP_HOME', "https://$DOMAIN");
-define('WP_SITEURL', "https://$DOMAIN");
+define('WP_HOME', 'https://$DOMAIN');
+define('WP_SITEURL', 'https://$DOMAIN');
 
 // Force SSL for admin and login
 define('FORCE_SSL_ADMIN', true);
@@ -79,7 +79,7 @@ if (isset($_SERVER['HTTP_X_FORWARDED_FOR']) && is_string($_SERVER['HTTP_X_FORWAR
 }
 
 // Forward proxy configuration for WordPress HTTP requests
-define('WP_PROXY_HOST',$PROXY_IP);
+define('WP_PROXY_HOST', $PROXY_IP);
 define('WP_PROXY_PORT', '3128');
 define('WP_PROXY_USERNAME', 'squid');
 define('WP_PROXY_PASSWORD', 'squid');
