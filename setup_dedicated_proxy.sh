@@ -1,22 +1,44 @@
 #!/bin/bash
 
-# Fixed Dedicated Proxy Server Setup Script
+# Multi-Domain Dedicated Proxy Server Setup Script
 # Run this on each proxy server
-# Usage: ./setup_dedicated_proxy.sh domain.com wordpress_backend_ip
+# Usage: ./setup_dedicated_proxy.sh "domain1.com:backend_ip1,domain2.com:backend_ip2"
 
-if [ $# -ne 2 ]; then
-    echo "Usage: $0 <domain> <wordpress_backend_ip>"
-    echo "Example: ./setup_dedicated_proxy.sh mystore.com 10.0.0.100"
+if [ $# -ne 1 ]; then
+    echo "Usage: $0 '<domain1:ip1,domain2:ip2>'"
+    echo "Example: ./setup_dedicated_proxy.sh 'mystore.com:10.0.0.100,blog.com:10.0.0.101'"
     exit 1
 fi
 
-DOMAIN=$1
-WORDPRESS_IP=$2
+# Parse domain configurations
+DOMAIN_CONFIGS="$1"
+DOMAINS=()
+BACKEND_IPS=()
+
+# Split configurations and validate
+IFS=',' read -ra CONFIGS <<< "$DOMAIN_CONFIGS"
+for config in "${CONFIGS[@]}"; do
+    if [[ $config =~ ^([^:]+):([^:]+)$ ]]; then
+        DOMAINS+=("${BASH_REMATCH[1]}")
+        BACKEND_IPS+=("${BASH_REMATCH[2]}")
+    else
+        echo "Error: Invalid format '$config'. Use 'domain:ip' format."
+        exit 1
+    fi
+done
+
+if [ ${#DOMAINS[@]} -eq 0 ]; then
+    echo "Error: No valid domain configurations found."
+    exit 1
+fi
 PROXY_USER="squid"
 PROXY_PASS="squid"
 
-echo "🚀 Setting up dedicated proxy server for $DOMAIN"
-echo "WordPress Backend: $WORDPRESS_IP"
+echo "🚀 Setting up multi-domain dedicated proxy server"
+echo "Domains and backends:"
+for i in "${!DOMAINS[@]}"; do
+    echo "  ${DOMAINS[$i]} → ${BACKEND_IPS[$i]}"
+done
 echo "Proxy Credentials: $PROXY_USER:$PROXY_PASS"
 
 # Update system
@@ -28,13 +50,26 @@ sudo apt install -y nginx certbot python3-certbot-nginx squid apache2-utils ufw 
 echo "✓ Packages installed"
 
 # === NGINX REVERSE PROXY SETUP ===
-echo "📝 Configuring Nginx reverse proxy..."
+echo "📝 Configuring Nginx reverse proxy for multiple domains..."
 
-# Create HTTP configuration first (for SSL certificate)
-sudo tee /etc/nginx/sites-available/$DOMAIN > /dev/null <<EOF
+# Add rate limiting to nginx.conf (create zones for each domain)
+for domain in "${DOMAINS[@]}"; do
+    domain_safe=$(echo "$domain" | sed 's/[^a-zA-Z0-9]/_/g')
+    sudo sed -i "/http {/a\    limit_req_zone \$binary_remote_addr zone=${domain_safe}:10m rate=10r/s;" /etc/nginx/nginx.conf
+done
+
+# Remove default site
+sudo rm -f /etc/nginx/sites-enabled/default
+
+# Create HTTP configuration for each domain (for SSL certificate)
+for i in "${!DOMAINS[@]}"; do
+    domain="${DOMAINS[$i]}"
+    echo "Creating initial HTTP config for $domain..."
+    
+    sudo tee "/etc/nginx/sites-available/$domain" > /dev/null <<EOF
 server {
     listen 80;
-    server_name $DOMAIN;
+    server_name $domain;
     
     # ACME challenge for Let's Encrypt
     location /.well-known/acme-challenge/ {
@@ -50,49 +85,58 @@ server {
 
 # HTTPS configuration will be added after SSL certificate
 EOF
-
-# Add rate limiting to nginx.conf
-sudo sed -i '/http {/a\    limit_req_zone $binary_remote_addr zone=wordpress:10m rate=10r/s;' /etc/nginx/nginx.conf
-
-# Remove default site and enable new site
-sudo rm -f /etc/nginx/sites-enabled/default
-sudo ln -sf /etc/nginx/sites-available/$DOMAIN /etc/nginx/sites-enabled/
+    
+    # Enable site
+    sudo ln -sf "/etc/nginx/sites-available/$domain" "/etc/nginx/sites-enabled/$domain"
+done
 
 # Test nginx configuration
 if sudo nginx -t; then
     sudo systemctl restart nginx
-    echo "✓ Nginx configured and restarted"
+    echo "✓ Nginx configured and restarted for all domains"
 else
     echo "❌ Nginx configuration error"
     exit 1
 fi
 
 # === SSL CERTIFICATE INSTALLATION ===
-echo "🔐 Installing SSL certificate..."
+echo "🔐 Installing SSL certificates for all domains..."
 
 # Create ACME challenge directory
 sudo mkdir -p /var/www/html/.well-known/acme-challenge/
 sudo chown -R www-data:www-data /var/www/html/
 
-# Install SSL certificate
-echo "Installing SSL certificate for $DOMAIN..."
-if sudo certbot --nginx -d $DOMAIN --non-interactive --agree-tos --email admin@$DOMAIN; then
-    echo "✓ SSL certificate installed successfully"
-    SSL_SUCCESS=true
-else
-    echo "⚠️ SSL certificate installation failed - continuing with HTTP only"
-    SSL_SUCCESS=false
-fi
+# Install SSL certificates for each domain
+SSL_SUCCESS=()
+for i in "${!DOMAINS[@]}"; do
+    domain="${DOMAINS[$i]}"
+    echo "Installing SSL certificate for $domain..."
+    if sudo certbot --nginx -d "$domain" --non-interactive --agree-tos --email "admin@$domain"; then
+        echo "✓ SSL certificate installed successfully for $domain"
+        SSL_SUCCESS[$i]=true
+    else
+        echo "⚠️ SSL certificate installation failed for $domain - continuing with HTTP only"
+        SSL_SUCCESS[$i]=false
+    fi
+done
 
 # === NGINX HTTPS CONFIGURATION ===
 echo "📝 Updating Nginx configuration for HTTPS..."
 
-if [ "$SSL_SUCCESS" = true ]; then
-    # Create complete HTTPS configuration
-    sudo tee /etc/nginx/sites-available/$DOMAIN > /dev/null <<EOF
+# Create HTTPS configuration for each domain
+for i in "${!DOMAINS[@]}"; do
+    domain="${DOMAINS[$i]}"
+    backend_ip="${BACKEND_IPS[$i]}"
+    domain_safe=$(echo "$domain" | sed 's/[^a-zA-Z0-9]/_/g')
+    
+    echo "Configuring HTTPS for $domain → $backend_ip"
+    
+    if [ "${SSL_SUCCESS[$i]}" = true ]; then
+        # Create complete HTTPS configuration
+        sudo tee "/etc/nginx/sites-available/$domain" > /dev/null <<EOF
 server {
     listen 80;
-    server_name $DOMAIN;
+    server_name $domain;
     
     # ACME challenge for Let's Encrypt
     location /.well-known/acme-challenge/ {
@@ -110,11 +154,11 @@ server {
     listen 443 ssl;
     listen [::]:443 ssl;
     http2 on;
-    server_name $DOMAIN;
+    server_name $domain;
 
     # SSL configuration
-    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
+    ssl_certificate /etc/letsencrypt/live/$domain/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
     
     # SSL settings
     ssl_protocols TLSv1.2 TLSv1.3;
@@ -129,9 +173,9 @@ server {
     
     location / {
         # Rate limiting
-        limit_req zone=wordpress burst=20 nodelay;
+        limit_req zone=${domain_safe} burst=20 nodelay;
         
-        proxy_pass http://$WORDPRESS_IP;
+        proxy_pass http://$backend_ip;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
@@ -155,7 +199,7 @@ server {
     
     # Cache static files
     location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|pdf|zip)$ {
-        proxy_pass http://$WORDPRESS_IP;
+        proxy_pass http://$backend_ip;
         proxy_set_header Host \$host;
         proxy_set_header X-Forwarded-Proto \$scheme;
         expires 1y;
@@ -170,12 +214,12 @@ server {
     }
 }
 EOF
-else
-    # Create HTTP-only configuration
-    sudo tee /etc/nginx/sites-available/$DOMAIN > /dev/null <<EOF
+    else
+        # Create HTTP-only configuration
+        sudo tee "/etc/nginx/sites-available/$domain" > /dev/null <<EOF
 server {
     listen 80;
-    server_name $DOMAIN;
+    server_name $domain;
     
     # Security headers
     add_header X-Frame-Options DENY;
@@ -190,9 +234,9 @@ server {
     
     location / {
         # Rate limiting
-        limit_req zone=wordpress burst=20 nodelay;
+        limit_req zone=${domain_safe} burst=20 nodelay;
         
-        proxy_pass http://$WORDPRESS_IP;
+        proxy_pass http://$backend_ip;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
@@ -216,7 +260,7 @@ server {
     
     # Cache static files
     location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|pdf|zip)$ {
-        proxy_pass http://$WORDPRESS_IP;
+        proxy_pass http://$backend_ip;
         proxy_set_header Host \$host;
         expires 1y;
         add_header Cache-Control "public, immutable";
@@ -230,12 +274,13 @@ server {
     }
 }
 EOF
-fi
+    fi
+done
 
 # Test and reload nginx
 if sudo nginx -t; then
     sudo systemctl reload nginx
-    echo "✓ Nginx HTTPS configuration updated"
+    echo "✓ Nginx HTTPS configuration updated for all domains"
 else
     echo "❌ Nginx configuration error"
     exit 1
@@ -248,13 +293,13 @@ echo "📝 Configuring Squid forward proxy..."
 sudo cp /etc/squid/squid.conf /etc/squid/squid.conf.backup
 
 sudo tee /etc/squid/squid.conf > /dev/null <<EOF
-# Squid configuration for $DOMAIN
+# Squid configuration for multi-domain proxy
 # Port configuration
 http_port 3128
 
 # Authentication
 auth_param basic program /usr/lib/squid/basic_ncsa_auth /etc/squid/passwd
-auth_param basic realm Squid Proxy for $DOMAIN
+auth_param basic realm Squid Multi-Domain Proxy
 auth_param basic credentialsttl 2 hours
 auth_param basic casesensitive off
 
@@ -267,7 +312,15 @@ acl localnet src fc00::/7
 acl localnet src fe80::/10
 
 # WordPress backend access
-acl wordpress_server src $WORDPRESS_IP
+EOF
+
+# Add ACL for each backend IP
+for backend_ip in "${BACKEND_IPS[@]}"; do
+    echo "acl backend_server src $backend_ip" | sudo tee -a /etc/squid/squid.conf > /dev/null
+done
+
+# Continue with rest of squid config
+sudo tee -a /etc/squid/squid.conf > /dev/null <<EOF
 
 # Safe ports and SSL ports
 acl SSL_ports port 443
@@ -289,7 +342,7 @@ http_access deny CONNECT !SSL_ports
 http_access allow localhost manager
 http_access deny manager
 http_access allow authenticated
-http_access allow wordpress_server
+http_access allow backend_server
 http_access allow localnet
 http_access allow localhost
 http_access deny all
@@ -348,8 +401,12 @@ sudo ufw allow 80/tcp comment 'HTTP'
 sudo ufw allow 443/tcp comment 'HTTPS'
 sudo ufw allow 3128/tcp comment 'Squid Proxy'
 
-# Allow WordPress backend
-sudo ufw allow from $WORDPRESS_IP comment "WordPress Backend"
+# Allow backend servers
+for i in "${!BACKEND_IPS[@]}"; do
+    backend_ip="${BACKEND_IPS[$i]}"
+    domain="${DOMAINS[$i]}"
+    sudo ufw allow from "$backend_ip" comment "Backend for $domain"
+done
 
 sudo ufw --force enable
 echo "✓ Firewall configured"
@@ -396,8 +453,20 @@ echo "📊 Setting up monitoring..."
 # Create status check script
 sudo tee /usr/local/bin/proxy-status.sh > /dev/null <<EOF
 #!/bin/bash
-echo "=== Proxy Server Status for $DOMAIN ==="
+echo "=== Multi-Domain Proxy Server Status ==="
 echo "Date: \$(date)"
+echo ""
+echo "Configured Domains:"
+EOF
+
+# Add domain status checks
+for i in "${!DOMAINS[@]}"; do
+    domain="${DOMAINS[$i]}"
+    backend_ip="${BACKEND_IPS[$i]}"
+    echo "echo \"  $domain → $backend_ip\"" | sudo tee -a /usr/local/bin/proxy-status.sh > /dev/null
+done
+
+sudo tee -a /usr/local/bin/proxy-status.sh > /dev/null <<EOF
 echo ""
 echo "Nginx Status:"
 systemctl is-active nginx
@@ -406,7 +475,7 @@ echo "Squid Status:"
 systemctl is-active squid
 echo ""
 echo "SSL Certificate Status:"
-certbot certificates | grep -A5 $DOMAIN
+certbot certificates
 echo ""
 echo "Disk Usage:"
 df -h /
@@ -424,15 +493,18 @@ EOF
 sudo chmod +x /usr/local/bin/proxy-status.sh
 
 # Add to crontab for daily monitoring
-echo "0 9 * * * /usr/local/bin/proxy-status.sh | mail -s 'Daily Proxy Status - $DOMAIN' admin@$DOMAIN" | sudo crontab -
+first_domain="${DOMAINS[0]}"
+echo "0 9 * * * /usr/local/bin/proxy-status.sh | mail -s 'Daily Multi-Domain Proxy Status' admin@$first_domain" | sudo crontab -
 
 echo ""
-echo "🎉 Dedicated proxy server setup complete!"
+echo "🎉 Multi-domain dedicated proxy server setup complete!"
 echo ""
 echo "=== CONFIGURATION SUMMARY ==="
-echo "Domain: $DOMAIN"
-echo "WordPress Backend: $WORDPRESS_IP"
 echo "Proxy Server IP: $(curl -s ifconfig.me)"
+echo "Configured domains and backends:"
+for i in "${!DOMAINS[@]}"; do
+    echo "  ${DOMAINS[$i]} → ${BACKEND_IPS[$i]}"
+done
 echo ""
 echo "=== FORWARD PROXY CREDENTIALS ==="
 echo "Host: $(curl -s ifconfig.me)"
@@ -441,16 +513,26 @@ echo "Username: $PROXY_USER"
 echo "Password: $PROXY_PASS"
 echo ""
 echo "=== NEXT STEPS ==="
-echo "1. Update DNS: $DOMAIN → $(curl -s ifconfig.me)"
-echo "2. Configure WordPress backend server with script"
-echo "3. Test HTTPS: curl -I https://$DOMAIN"
-echo "4. Test proxy: curl -x $PROXY_USER:$PROXY_PASS@$(curl -s ifconfig.me):3128 https://httpbin.org/ip"
+for i in "${!DOMAINS[@]}"; do
+    domain="${DOMAINS[$i]}"
+    echo "$((i+1)). Update DNS: $domain → $(curl -s ifconfig.me)"
+done
+echo "$((${#DOMAINS[@]}+1)). Configure backend servers"
+echo "$((${#DOMAINS[@]}+2)). Test HTTPS for each domain:"
+for domain in "${DOMAINS[@]}"; do
+    echo "    curl -I https://$domain"
+done
+echo "$((${#DOMAINS[@]}+3)). Test proxy: curl -x $PROXY_USER:$PROXY_PASS@$(curl -s ifconfig.me):3128 https://httpbin.org/ip"
 echo ""
 echo "=== CREDENTIALS SUMMARY ==="
 echo "Forward Proxy: $PROXY_USER:$PROXY_PASS@$(curl -s ifconfig.me):3128"
-if [ "$SSL_SUCCESS" = true ]; then
-    echo "HTTPS: ✓ Enabled"
-else
-    echo "HTTPS: ❌ Failed - retry with: sudo certbot --nginx -d $DOMAIN -d www.$DOMAIN"
-fi
+echo "SSL Status:"
+for i in "${!DOMAINS[@]}"; do
+    domain="${DOMAINS[$i]}"
+    if [ "${SSL_SUCCESS[$i]}" = true ]; then
+        echo "  $domain: ✓ Enabled"
+    else
+        echo "  $domain: ❌ Failed - retry with: sudo certbot --nginx -d $domain"
+    fi
+done
 echo ""
